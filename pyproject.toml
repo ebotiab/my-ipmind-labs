@@ -1,0 +1,30 @@
+[project]
+name = "ipmind-labs"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.31.0",
+    "fastexcel>=0.19.0",
+    "marimo>=0.19.11",
+    "polars>=1.38.1",
+    "pydantic-ai>=1.63.0",
+    "pydantic-settings>=2.13.1",
+    "python-dotenv>=1.2.1",
+    "pyzmq>=27.1.0",
+    "scikit-learn>=1.8.0",
+    "streamlit>=1.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest<8.0.0,>=7.4.3",
+    "ruff<1.0.0,>=0.2.2",
+    "sqlalchemy>=2.0.46",
+    "watchdog>=6.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
