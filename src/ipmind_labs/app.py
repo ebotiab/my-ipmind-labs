@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import random
 
 import polars as pl
 import streamlit as st
@@ -13,6 +14,8 @@ from ipmind_labs.agents.metrics_explainer_agent import ModelMetrics, get_metrics
 from ipmind_labs.db import (
     JobRecord,
     get_available_standards_from_db,
+    get_benchmark_names_from_db,
+    get_job_stats_for_project,
     get_jobs_for_project,
     get_recent_projects_list,
     get_standard_truth_labels_from_db,
@@ -34,8 +37,10 @@ def fetch_jobs_sync(
     end_date: datetime.date,
     valid_claim_ids: list[str],
     batch_id: str | None = None,
+    standard: str | None = None,
     filter_is_independent: bool = False,
     filter_claim_number_1: bool = False,
+    limit_jobs: int = 0,
 ) -> list[JobRecord]:
     return asyncio.run(
         get_jobs_for_project(
@@ -44,8 +49,35 @@ def fetch_jobs_sync(
             end_date,
             valid_claim_ids,
             batch_id,
+            standard,
             filter_is_independent,
             filter_claim_number_1,
+            limit_jobs,
+        )
+    )
+
+
+@st.cache_data(show_spinner=True)
+def fetch_job_stats_sync(
+    project_name: str,
+    start_date: datetime.date,
+    end_date: datetime.date,
+    batch_id: str | None = None,
+    standard: str | None = None,
+    filter_is_independent: bool = False,
+    filter_claim_number_1: bool = False,
+    limit_jobs: int = 0,
+) -> tuple[int, int]:
+    return asyncio.run(
+        get_job_stats_for_project(
+            project_name,
+            start_date,
+            end_date,
+            batch_id,
+            standard,
+            filter_is_independent,
+            filter_claim_number_1,
+            limit_jobs,
         )
     )
 
@@ -61,9 +93,16 @@ def get_available_standards() -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def load_standard_truth_labels(standard: str):
+def load_benchmark_names(standard: str) -> list[str]:
+    return asyncio.run(get_benchmark_names_from_db(standard))
+
+
+@st.cache_data(show_spinner=False)
+def load_standard_truth_labels(standard: str, benchmark_name: str):
     try:
-        tp_ids, tn_ids = asyncio.run(get_standard_truth_labels_from_db(standard))
+        tp_ids, tn_ids = asyncio.run(
+            get_standard_truth_labels_from_db(standard, benchmark_name)
+        )
         return tp_ids, tn_ids
     except Exception as e:
         st.error(f"Failed to load labels from DB: {e}")
@@ -73,15 +112,13 @@ def load_standard_truth_labels(standard: str):
 def display_metrics(
     df: pl.DataFrame, tp_ids: list[str], tn_ids: list[str]
 ) -> pl.DataFrame | None:
-    valid_ids = tp_ids + tn_ids
-    total_benchmark_claims = len(valid_ids)
-
     if "claim_uuid" not in df.columns:
         st.info(
             "Evaluation features require 'claim_uuid' to be fetched from the database. Please update the query."
         )
         return None
 
+    valid_ids = tp_ids + tn_ids
     df_eval = df.filter(
         pl.col("claim_uuid").cast(pl.Utf8).is_in(valid_ids)
     ).with_columns(
@@ -98,13 +135,8 @@ def display_metrics(
         .otherwise(0),
     )
 
-    matched_claims = df_eval["claim_uuid"].n_unique() if len(df_eval) > 0 else 0
-
     st.markdown("---")
     st.markdown("### Evaluation Metrics")
-    st.info(
-        f"**Benchmark Match:** {matched_claims} jobs matched out of {total_benchmark_claims} benchmark claims."
-    )
 
     if len(df_eval) == 0:
         return None
@@ -291,24 +323,36 @@ def main():
         "Evaluate PRISM Claim Analysis performance for patent jobs belonging to a specific Project."
     )
 
-    recent_projects = fetch_recent_projects_sync(10)
-    if recent_projects:
-        selection = st.pills(
-            "Recent Projects", recent_projects, selection_mode="single"
-        )
-        if selection:
-            st.session_state["project_name_input"] = selection
-
     available_standards = get_available_standards()
 
-    with st.form("query_form"):
-        project_name = st.text_input("Project Name", key="project_name_input")
+    with st.container(border=True):
+        st.subheader("Job Filters")
 
-        standard = st.selectbox(
-            "Standard",
-            options=available_standards,
-            help="Select the benchmark standard to filter jobs by claim_id.",
-        )
+        recent_projects = fetch_recent_projects_sync(10)
+
+        def populate_project_name():
+            selection = st.session_state.get("project_pills")
+            if selection:
+                st.session_state["project_name_input"] = selection
+
+        if recent_projects:
+            st.pills(
+                "Recent Projects",
+                recent_projects,
+                selection_mode="single",
+                key="project_pills",
+                on_change=populate_project_name,
+            )
+
+        col9, col10 = st.columns(2)
+        with col9:
+            project_name = st.text_input("Project Name", key="project_name_input")
+        with col10:
+            standard = st.selectbox(
+                "Standard",
+                options=available_standards,
+                help="Select the standard to filter jobs by.",
+            )
 
         col1, col2 = st.columns(2)
         with col1:
@@ -328,12 +372,12 @@ def main():
                 value="",
             )
         with col4:
-            limit_claims = st.number_input(
-                "Limit Benchmark Claims",
+            limit_jobs = st.number_input(
+                "Limit Jobs",
                 min_value=0,
-                max_value=10000,
+                max_value=100000,
                 value=0,
-                help="Maximum number of claim IDs to extract from the benchmark for evaluation. Set to 0 to disable.",
+                help="Maximum number of jobs to fetch. Set to 0 to disable.",
             )
 
         col5, col6 = st.columns(2)
@@ -350,7 +394,33 @@ def main():
                 help="Only retrieve jobs for the first claim of a patent.",
             )
 
-        submitted = st.form_submit_button("Fetch Jobs Data")
+        st.markdown("---")
+        st.subheader("Benchmark Filters")
+
+        benchmark_names = load_benchmark_names(standard) if standard else []
+        benchmark_name = st.selectbox(
+            "Benchmark Name",
+            options=benchmark_names,
+            help="Select the specific benchmark name to evaluate the jobs.",
+        )
+
+        col7, col8 = st.columns(2)
+        with col7:
+            limit_claims = st.number_input(
+                "Limit Benchmark Claims",
+                min_value=0,
+                max_value=10000,
+                value=0,
+                help="Maximum number of claim IDs to extract from the benchmark for evaluation. Set to 0 to disable.",
+            )
+        with col8:
+            balance_essentiality = st.checkbox(
+                "Balance essentiality",
+                value=False,
+                help="Sample an equal number of Positive and Negative claims from the benchmark.",
+            )
+
+        submitted = st.button("Run Evaluation", type="primary")
 
     if submitted:
         if "metrics_explanation" in st.session_state:
@@ -360,11 +430,22 @@ def main():
             st.warning("Please enter a Project Name.")
         elif not standard:
             st.warning("Please select a Standard.")
+        elif not benchmark_name:
+            st.warning("Please select a Benchmark Name.")
         else:
-            tp_ids, tn_ids = load_standard_truth_labels(standard)
+            tp_ids, tn_ids = load_standard_truth_labels(standard, benchmark_name)
+
+            if balance_essentiality:
+                min_len = min(len(tp_ids), len(tn_ids))
+                if len(tp_ids) > min_len:
+                    tp_ids = random.sample(tp_ids, min_len)
+                elif len(tn_ids) > min_len:
+                    tn_ids = random.sample(tn_ids, min_len)
+
             valid_ids = tp_ids + tn_ids
 
             if limit_claims > 0:
+                random.shuffle(valid_ids)
                 valid_ids = valid_ids[:limit_claims]
 
             if not valid_ids:
@@ -372,6 +453,26 @@ def main():
                     "No valid claim IDs found for the selected standard benchmark."
                 )
                 return
+
+            with st.spinner("Fetching job statistics..."):
+                try:
+                    total_jobs, unique_patents = fetch_job_stats_sync(
+                        project_name,
+                        start_date,
+                        end_date,
+                        batch_id if batch_id else None,
+                        standard,
+                        filter_is_independent,
+                        filter_claim_number_1,
+                        limit_jobs,
+                    )
+                    st.session_state["job_stats"] = {
+                        "total_jobs": total_jobs,
+                        "unique_patents": unique_patents,
+                    }
+                except Exception as e:
+                    st.error(f"Error fetching job stats: {e}")
+                    return
 
             with st.spinner("Fetching jobs from Supabase..."):
                 try:
@@ -381,8 +482,10 @@ def main():
                         end_date,
                         valid_ids,
                         batch_id if batch_id else None,
+                        standard,
                         filter_is_independent,
                         filter_claim_number_1,
+                        limit_jobs,
                     )
 
                     if not jobs:
@@ -418,7 +521,16 @@ def main():
         tp_ids = st.session_state["tp_ids"]
         tn_ids = st.session_state["tn_ids"]
 
-        st.success(f"Found {len(df)} jobs for project '{eval_project_name}'.")
+        if "job_stats" in st.session_state:
+            stats = st.session_state["job_stats"]
+            st.success(
+                f"**Total jobs requested:** {stats['total_jobs']} jobs from {stats['unique_patents']} unique patents."
+            )
+        else:
+            st.success(f"Found {len(df)} jobs for project '{eval_project_name}'.")
+        st.info(
+            f"**Benchmark Match:** {len(df)} jobs matched out of {len(tp_ids + tn_ids)} benchmark claims."
+        )
 
         df_eval = None
         if tp_ids or tn_ids:
