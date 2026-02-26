@@ -1,3 +1,5 @@
+from functools import cache
+
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,4 +20,6 @@ class Settings(BaseSettings):
         return f"postgresql://{self.postgres_user}:{self.postgres_password.get_secret_value()}@{self.postgres_server}:{self.postgres_port}/{self.postgres_db}"
 
 
-settings = Settings()  # type: ignore
+@cache
+def get_settings() -> Settings:
+    return Settings()  # pyright: ignore[reportCallIssue]

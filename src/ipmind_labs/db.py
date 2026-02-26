@@ -1,9 +1,10 @@
+import asyncio
 from datetime import date, datetime
 
 import asyncpg
 from pydantic import BaseModel, ConfigDict
 
-from ipmind_labs.config import settings
+from ipmind_labs.config import get_settings
 
 
 class JobRecord(BaseModel):
@@ -20,6 +21,31 @@ class JobRecord(BaseModel):
     essentiality_reasoning: str | None
     implementation_likelihood: float | None
     implementation_reasoning: str | None
+
+
+class AsyncDBPool:
+    def __init__(self, db_url: str):
+        self.db_url = db_url
+        self.pool: asyncpg.Pool | None = None
+        # Creamos un único bucle de eventos dedicado para la base de datos
+        self.loop = asyncio.new_event_loop()
+        # Inicializamos el pool sincrónicamente bloqueando este bucle solo una vez
+        self.loop.run_until_complete(self._init_pool())
+
+    async def _init_pool(self):
+        self.pool = await asyncpg.create_pool(
+            dsn=self.db_url,
+            min_size=2,  # Mantén 2 conexiones siempre abiertas
+            max_size=10,  # Sube hasta 10 si hay muchos usuarios simultáneos
+            statement_cache_size=0,  # VITAL para Supabase (PgBouncer)
+        )
+
+    def run_sync(self, coro):
+        """
+        Esta es la función mágica que reemplazará tu asyncio.run().
+        Ejecuta tus funciones asíncronas en el bucle que ya tiene el Pool.
+        """
+        return self.loop.run_until_complete(coro)
 
 
 async def get_jobs_for_project(
@@ -92,7 +118,7 @@ async def get_jobs_for_project(
         query += f"    LIMIT ${len(args)}\n"
 
     # NOTE: statement_cache_size=0 because Supabase uses PgBouncer in transaction mode
-    conn = await asyncpg.connect(settings.database_url, statement_cache_size=0)
+    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
     try:
         records = await conn.fetch(query, *args)
 
@@ -116,7 +142,7 @@ async def get_recent_projects_list(limit: int = 10) -> list[str]:
     LIMIT $1
     """
 
-    conn = await asyncpg.connect(settings.database_url, statement_cache_size=0)
+    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
     try:
         records = await conn.fetch(query, limit)
         return [r["name"] for r in records if r["name"]]
@@ -138,7 +164,7 @@ async def get_available_standards_from_db() -> list[str]:
     WHERE c.relname = 'prism_benchmarks' AND a.attname = 'standard'
     ORDER BY e.enumsortorder
     """
-    conn = await asyncpg.connect(settings.database_url, statement_cache_size=0)
+    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
     try:
         records = await conn.fetch(query)
         return [r["enumlabel"] for r in records]
@@ -156,7 +182,7 @@ async def get_benchmark_names_from_db(standard: str) -> list[str]:
     WHERE standard::text = $1 AND name IS NOT NULL
     ORDER BY name
     """
-    conn = await asyncpg.connect(settings.database_url, statement_cache_size=0)
+    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
     try:
         records = await conn.fetch(query, standard)
         return [r["name"] for r in records]
@@ -177,7 +203,7 @@ async def get_standard_truth_labels_from_db(
     FROM prism_benchmarks
     WHERE standard::text = $1 AND name = $2
     """
-    conn = await asyncpg.connect(settings.database_url, statement_cache_size=0)
+    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
     try:
         records = await conn.fetch(query, standard, benchmark_name)
         tp_ids = [r["claim_id"] for r in records if r["expected_essentiality"] == 1]
@@ -247,7 +273,7 @@ async def get_job_stats_for_project(
     FROM filtered_claims;
     """
 
-    conn = await asyncpg.connect(settings.database_url, statement_cache_size=0)
+    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
     try:
         row = await conn.fetchrow(query, *args)
         return row["total_jobs"] or 0, row["unique_patents"] or 0
