@@ -1,10 +1,8 @@
-import asyncio
 from datetime import date, datetime
 
-import asyncpg
+import streamlit as st
 from pydantic import BaseModel, ConfigDict
-
-from ipmind_labs.config import get_settings
+from sqlalchemy import text
 
 
 class JobRecord(BaseModel):
@@ -16,39 +14,23 @@ class JobRecord(BaseModel):
     job_created_at: datetime
     claim_number: int
     claim_text: str | None
-    is_independent: bool | None
     essentiality_likelihood: str | None
     essentiality_reasoning: str | None
     implementation_likelihood: float | None
     implementation_reasoning: str | None
 
 
-class AsyncDBPool:
-    def __init__(self, db_url: str):
-        self.db_url = db_url
-        self.pool: asyncpg.Pool | None = None
-        # Creamos un único bucle de eventos dedicado para la base de datos
-        self.loop = asyncio.new_event_loop()
-        # Inicializamos el pool sincrónicamente bloqueando este bucle solo una vez
-        self.loop.run_until_complete(self._init_pool())
-
-    async def _init_pool(self):
-        self.pool = await asyncpg.create_pool(
-            dsn=self.db_url,
-            min_size=2,  # Mantén 2 conexiones siempre abiertas
-            max_size=10,  # Sube hasta 10 si hay muchos usuarios simultáneos
-            statement_cache_size=0,  # VITAL para Supabase (PgBouncer)
-        )
-
-    def run_sync(self, coro):
-        """
-        Esta es la función mágica que reemplazará tu asyncio.run().
-        Ejecuta tus funciones asíncronas en el bucle que ya tiene el Pool.
-        """
-        return self.loop.run_until_complete(coro)
+def _get_conn(ttl: int | None = None):
+    """Return the shared Streamlit SQL connection (reads .streamlit/secrets.toml)."""
+    return st.connection("postgresql", type="sql", ttl=ttl)
 
 
-async def get_jobs_for_project(
+# ---------------------------------------------------------------------------
+# Public query helpers
+# ---------------------------------------------------------------------------
+
+
+def get_jobs_for_project(
     project_name: str,
     start_date: date,
     end_date: date,
@@ -64,7 +46,14 @@ async def get_jobs_for_project(
     and checks if the claim is within the valid benchmark claim IDs.
     Deduplicates jobs by keeping only the most recently created one per claim.
     """
-    query = """
+    clauses: list[str] = []
+    params: dict = {
+        "project_name": project_name,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
+    base = """
     SELECT DISTINCT ON (c.id)
         j.id::text AS job_uuid,
         c.id::text AS claim_uuid,
@@ -83,114 +72,106 @@ async def get_jobs_for_project(
     JOIN patent_claims c ON pat.id = c.patent_id
     JOIN jobs j ON j.claim_id = c.id
     LEFT JOIN prism_results pr ON pr.job_id = j.id
-    WHERE p.name = $1
+    WHERE p.name = :project_name
       AND p.organization_id = '61a01994-8e93-42b0-a0f7-a46db8f8e883'
-      AND j.created_at >= $2
-      AND j.created_at <= $3
-      AND c.id = ANY($4::uuid[])
+      AND j.created_at >= :start_date
+      AND j.created_at <= :end_date
+      AND c.id::text IN :claim_ids
     """
 
-    args = [project_name, start_date, end_date, valid_claim_ids]
+    # Build the tuple for the IN clause
+    params["claim_ids"] = tuple(valid_claim_ids)
 
     if batch_id:
-        args.append(batch_id)
-        query += f"      AND j.batch_id = ${len(args)}\n"
+        clauses.append("AND j.batch_id = :batch_id")
+        params["batch_id"] = batch_id
 
     if standard:
-        args.append(standard)
-        # Assuming the 'standard' exists on prism_results or similar, wait, the user said filter jobs according their value in the standard column. We should map it to PRISM results standard if that's where it is. Wait, if it's on jobs or prism_results? Let's assume prism_results.standard since jobs might not have it natively, or maybe it's j.standard. I'll add joining prism_results if not joined, but it is joined.
-        # As there are multiple tables, we shouldn't guess. The user said "filter the jobs according their value in the standard column". Let's assume it's `j.standard` or `pr.standard`. For safety let's assume `pr.standard`.
-        # Actually I need to check the exact column location. Let's execute a quick query first if unsure, but I have to replace it. I'll use `pr.standard::text`.
-        query += f"      AND pr.standard::text = ${len(args)}\n"
+        clauses.append("AND pr.standard::text = :standard")
+        params["standard"] = standard
 
     if filter_is_independent:
-        query += "      AND c.is_independent = True\n"
+        clauses.append("AND c.is_independent = True")
 
     if filter_claim_number_1:
-        query += "      AND c.number_in_patent = 1\n"
+        clauses.append("AND c.number_in_patent = 1")
 
-    query += """
-    ORDER BY c.id, j.created_at DESC
-    """
+    order = "ORDER BY c.id, j.created_at DESC"
 
+    limit_clause = ""
     if limit_jobs > 0:
-        args.append(limit_jobs)
-        query += f"    LIMIT ${len(args)}\n"
+        limit_clause = "LIMIT :limit_jobs"
+        params["limit_jobs"] = limit_jobs
 
-    # NOTE: statement_cache_size=0 because Supabase uses PgBouncer in transaction mode
-    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
-    try:
-        records = await conn.fetch(query, *args)
+    query = "\n".join([base, *clauses, order, limit_clause])
 
-        if not records:
-            return []
+    conn = _get_conn()
+    with conn.session as session:
+        result = session.execute(text(query), params)
+        rows = result.mappings().all()
 
-        return [JobRecord.model_validate(dict(r)) for r in records]
-    finally:
-        await conn.close()
+    if not rows:
+        return []
+
+    return [JobRecord.model_validate(dict(r)) for r in rows]
 
 
-async def get_recent_projects_list(limit: int = 10) -> list[str]:
-    """
-    Retrieves the names of the most recently created projects from Supabase.
-    """
+def get_recent_projects_list(limit: int = 10) -> list[str]:
+    """Retrieves the names of the most recently created projects."""
     query = """
     SELECT name
     FROM projects
     WHERE organization_id = '61a01994-8e93-42b0-a0f7-a46db8f8e883'
     ORDER BY created_at DESC
-    LIMIT $1
+    LIMIT :limit
     """
+    conn = _get_conn()
+    with conn.session as session:
+        result = session.execute(text(query), {"limit": limit})
+        rows = result.mappings().all()
 
-    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
-    try:
-        records = await conn.fetch(query, limit)
-        return [r["name"] for r in records if r["name"]]
-    finally:
-        await conn.close()
+    return [r["name"] for r in rows if r["name"]]
 
 
-async def get_available_standards_from_db() -> list[str]:
+def get_available_standards() -> list[str]:
     """
     Retrieves the possible values of the custom enum type used in the 'standard'
     column of the 'prism_benchmarks' table.
     """
     query = """
-    SELECT e.enumlabel 
-    FROM pg_enum e 
-    JOIN pg_type t ON e.enumtypid = t.oid 
-    JOIN pg_attribute a ON a.atttypid = t.oid 
-    JOIN pg_class c ON a.attrelid = c.oid 
+    SELECT e.enumlabel
+    FROM pg_enum e
+    JOIN pg_type t ON e.enumtypid = t.oid
+    JOIN pg_attribute a ON a.atttypid = t.oid
+    JOIN pg_class c ON a.attrelid = c.oid
     WHERE c.relname = 'prism_benchmarks' AND a.attname = 'standard'
     ORDER BY e.enumsortorder
     """
-    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
-    try:
-        records = await conn.fetch(query)
-        return [r["enumlabel"] for r in records]
-    finally:
-        await conn.close()
+    conn = _get_conn()
+    with conn.session as session:
+        result = session.execute(text(query))
+        rows = result.mappings().all()
+
+    return [r["enumlabel"] for r in rows]
 
 
-async def get_benchmark_names_from_db(standard: str) -> list[str]:
-    """
-    Retrieves the unique benchmark names for a given standard.
-    """
+def get_benchmark_names(standard: str) -> list[str]:
+    """Retrieves the unique benchmark names for a given standard."""
     query = """
     SELECT DISTINCT name
     FROM prism_benchmarks
-    WHERE standard::text = $1 AND name IS NOT NULL
+    WHERE standard::text = :standard AND name IS NOT NULL
     ORDER BY name
     """
-    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
-    try:
-        records = await conn.fetch(query, standard)
-        return [r["name"] for r in records]
-    finally:
-        await conn.close()
+    conn = _get_conn(ttl=60*60)
+    with conn.session as session:
+        result = session.execute(text(query), {"standard": standard})
+        rows = result.mappings().all()
+
+    return [r["name"] for r in rows]
 
 
-async def get_standard_truth_labels_from_db(
+def get_standard_truth_labels(
     standard: str,
     benchmark_name: str,
 ) -> tuple[list[str], list[str]]:
@@ -201,19 +182,21 @@ async def get_standard_truth_labels_from_db(
     query = """
     SELECT claim_id::text, expected_essentiality
     FROM prism_benchmarks
-    WHERE standard::text = $1 AND name = $2
+    WHERE standard::text = :standard AND name = :benchmark_name
     """
-    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
-    try:
-        records = await conn.fetch(query, standard, benchmark_name)
-        tp_ids = [r["claim_id"] for r in records if r["expected_essentiality"] == 1]
-        tn_ids = [r["claim_id"] for r in records if r["expected_essentiality"] == 0]
-        return tp_ids, tn_ids
-    finally:
-        await conn.close()
+    conn = _get_conn()
+    with conn.session as session:
+        result = session.execute(
+            text(query), {"standard": standard, "benchmark_name": benchmark_name}
+        )
+        rows = result.mappings().all()
+
+    tp_ids = [r["claim_id"] for r in rows if r["expected_essentiality"] == 1]
+    tn_ids = [r["claim_id"] for r in rows if r["expected_essentiality"] == 0]
+    return tp_ids, tn_ids
 
 
-async def get_job_stats_for_project(
+def get_job_stats_for_project(
     project_name: str,
     start_date: date,
     end_date: date,
@@ -223,11 +206,17 @@ async def get_job_stats_for_project(
     filter_claim_number_1: bool = False,
     limit_jobs: int = 0,
 ) -> tuple[int, int]:
-    """Returns (total_jobs, unique_patents) for a project + filters"""
+    """Returns (total_jobs, unique_patents) for a project + filters."""
+    clauses: list[str] = []
+    params: dict = {
+        "project_name": project_name,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
 
-    query = """
+    base = """
     WITH filtered_claims AS (
-        SELECT 
+        SELECT
             c.id AS claim_id,
             c.patent_id AS patent_id
         FROM projects p
@@ -235,47 +224,46 @@ async def get_job_stats_for_project(
         JOIN patent_claims c ON pp.patent_id = c.patent_id
         JOIN jobs j ON j.claim_id = c.id
         LEFT JOIN prism_results pr ON pr.job_id = j.id
-        WHERE p.name = $1
+        WHERE p.name = :project_name
           AND p.organization_id = '61a01994-8e93-42b0-a0f7-a46db8f8e883'
-          AND j.created_at >= $2
-          AND j.created_at <= $3
+          AND j.created_at >= :start_date
+          AND j.created_at <= :end_date
     """
-
-    args = [project_name, start_date, end_date]
 
     if batch_id:
-        args.append(batch_id)
-        query += f"      AND j.batch_id = ${len(args)}\n"
+        clauses.append("AND j.batch_id = :batch_id")
+        params["batch_id"] = batch_id
 
     if filter_is_independent:
-        query += "      AND c.is_independent = True\n"
+        clauses.append("AND c.is_independent = True")
 
     if filter_claim_number_1:
-        query += "      AND c.number_in_patent = 1\n"
+        clauses.append("AND c.number_in_patent = 1")
 
     if standard:
-        args.append(standard)
-        query += f"      AND pr.standard::text = ${len(args)}\n"
+        clauses.append("AND pr.standard::text = :standard")
+        params["standard"] = standard
 
-    query += """
-        GROUP BY c.id, c.patent_id
-    """
-
+    group_and_limit = "GROUP BY c.id, c.patent_id"
     if limit_jobs > 0:
-        args.append(limit_jobs)
-        query += f"    LIMIT ${len(args)}\n"
+        group_and_limit += "\nLIMIT :limit_jobs"
+        params["limit_jobs"] = limit_jobs
 
-    query += """
+    tail = """
     )
-    SELECT 
+    SELECT
         COUNT(claim_id) as total_jobs,
         COUNT(DISTINCT patent_id) as unique_patents
     FROM filtered_claims;
     """
 
-    conn = await asyncpg.connect(get_settings().database_url, statement_cache_size=0)
-    try:
-        row = await conn.fetchrow(query, *args)
-        return row["total_jobs"] or 0, row["unique_patents"] or 0
-    finally:
-        await conn.close()
+    query = "\n".join([base, *clauses, group_and_limit, tail])
+
+    conn = _get_conn()
+    with conn.session as session:
+        result = session.execute(text(query), params)
+        row = result.mappings().first()
+
+    if row is None:
+        return 0, 0
+    return row["total_jobs"] or 0, row["unique_patents"] or 0

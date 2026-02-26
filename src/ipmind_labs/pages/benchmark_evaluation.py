@@ -12,93 +12,13 @@ from sklearn.metrics import (
 
 from ipmind_labs.agents.metrics_explainer_agent import ModelMetrics, get_metrics_summary
 from ipmind_labs.db import (
-    JobRecord,
-    get_available_standards_from_db,
-    get_benchmark_names_from_db,
+    get_available_standards,
+    get_benchmark_names,
     get_job_stats_for_project,
     get_jobs_for_project,
     get_recent_projects_list,
-    get_standard_truth_labels_from_db,
+    get_standard_truth_labels,
 )
-
-
-@st.cache_data(show_spinner=False)
-def fetch_jobs_sync(
-    project_name: str,
-    start_date: datetime.date,
-    end_date: datetime.date,
-    valid_claim_ids: list[str],
-    batch_id: str | None = None,
-    standard: str | None = None,
-    filter_is_independent: bool = False,
-    filter_claim_number_1: bool = False,
-    limit_jobs: int = 0,
-) -> list[JobRecord]:
-    return asyncio.run(
-        get_jobs_for_project(
-            project_name,
-            start_date,
-            end_date,
-            valid_claim_ids,
-            batch_id,
-            standard,
-            filter_is_independent,
-            filter_claim_number_1,
-            limit_jobs,
-        )
-    )
-
-
-@st.cache_data(show_spinner=True)
-def fetch_job_stats_sync(
-    project_name: str,
-    start_date: datetime.date,
-    end_date: datetime.date,
-    batch_id: str | None = None,
-    standard: str | None = None,
-    filter_is_independent: bool = False,
-    filter_claim_number_1: bool = False,
-    limit_jobs: int = 0,
-) -> tuple[int, int]:
-    return asyncio.run(
-        get_job_stats_for_project(
-            project_name,
-            start_date,
-            end_date,
-            batch_id,
-            standard,
-            filter_is_independent,
-            filter_claim_number_1,
-            limit_jobs,
-        )
-    )
-
-
-@st.cache_data(show_spinner=False, ttl=60)
-def fetch_recent_projects_sync(limit: int = 10):
-    return asyncio.run(get_recent_projects_list(limit))
-
-
-@st.cache_data(show_spinner=False)
-def get_available_standards() -> list[str]:
-    return asyncio.run(get_available_standards_from_db())
-
-
-@st.cache_data(show_spinner=False)
-def load_benchmark_names(standard: str) -> list[str]:
-    return asyncio.run(get_benchmark_names_from_db(standard))
-
-
-@st.cache_data(show_spinner=False)
-def load_standard_truth_labels(standard: str, benchmark_name: str):
-    try:
-        tp_ids, tn_ids = asyncio.run(
-            get_standard_truth_labels_from_db(standard, benchmark_name)
-        )
-        return tp_ids, tn_ids
-    except Exception as e:
-        st.error(f"Failed to load labels from DB: {e}")
-        return [], []
 
 
 def display_metrics(
@@ -309,7 +229,7 @@ def display_reasoning_inspection(df_eval: pl.DataFrame):
 
 
 def main():
-    st.title("IP Mind - PRISM Claim Analysis Evaluator")
+    st.title("IP Mind - PRISM Benchmark Evaluator")
 
     st.markdown(
         "Evaluate PRISM Claim Analysis performance for patent jobs belonging to a specific Project."
@@ -320,7 +240,8 @@ def main():
     with st.container(border=True):
         st.subheader("Job Filters")
 
-        recent_projects = fetch_recent_projects_sync(10)
+        recent_projects = get_recent_projects_list(30)
+        recent_projects = [p for p in recent_projects if "test" not in p]
 
         def populate_project_name():
             selection = st.session_state.get("project_pills")
@@ -389,7 +310,7 @@ def main():
         st.markdown("---")
         st.subheader("Benchmark Filters")
 
-        benchmark_names = load_benchmark_names(standard) if standard else []
+        benchmark_names = get_benchmark_names(standard) if standard else []
         benchmark_name = st.selectbox(
             "Benchmark Name",
             options=benchmark_names,
@@ -425,7 +346,7 @@ def main():
         elif not benchmark_name:
             st.warning("Please select a Benchmark Name.")
         else:
-            tp_ids, tn_ids = load_standard_truth_labels(standard, benchmark_name)
+            tp_ids, tn_ids = get_standard_truth_labels(standard, benchmark_name)
 
             if balance_essentiality:
                 min_len = min(len(tp_ids), len(tn_ids))
@@ -448,7 +369,7 @@ def main():
 
             with st.spinner("Fetching job statistics..."):
                 try:
-                    total_jobs, unique_patents = fetch_job_stats_sync(
+                    total_jobs, unique_patents = get_job_stats_for_project(
                         project_name,
                         start_date,
                         end_date,
@@ -468,7 +389,7 @@ def main():
 
             with st.spinner("Fetching jobs from Supabase..."):
                 try:
-                    jobs = fetch_jobs_sync(
+                    jobs = get_jobs_for_project(
                         project_name,
                         start_date,
                         end_date,
@@ -528,9 +449,17 @@ def main():
         if tp_ids or tn_ids:
             df_eval = display_metrics(df, tp_ids, tn_ids)
 
-        st.dataframe(df.to_pandas(), width="stretch", hide_index=True)
-
         if df_eval is not None:
+            st.dataframe(
+                df_eval.rename(
+                    mapping={
+                        "prediction": "is_predicted_ess_above_0.7",
+                        "label": "expected_essentiality",
+                    }
+                ),
+                width="stretch",
+                hide_index=True,
+            )
             display_reasoning_inspection(df_eval)
 
 
