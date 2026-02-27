@@ -12,12 +12,11 @@ from sklearn.metrics import (
 
 from ipmind_labs.agents.metrics_explainer_agent import ModelMetrics, get_metrics_summary
 from ipmind_labs.db import (
-    get_available_standards,
-    get_benchmark_names,
+    get_benchmark_projects,
     get_job_stats_for_project,
     get_jobs_for_project,
-    get_recent_projects_list,
     get_standard_truth_labels,
+    get_standards_for_project,
 )
 
 
@@ -26,7 +25,8 @@ def display_metrics(
 ) -> pl.DataFrame | None:
     if "claim_uuid" not in df.columns:
         st.info(
-            "Evaluation features require 'claim_uuid' to be fetched from the database. Please update the query."
+            "Evaluation features require 'claim_uuid' to be fetched from the database. "
+            "Please update the query."
         )
         return None
 
@@ -232,40 +232,45 @@ def main():
     st.title("IP Mind - PRISM Benchmark Evaluator")
 
     st.markdown(
-        "Evaluate PRISM Claim Analysis performance for patent jobs belonging to a specific Project."
+        "Evaluate PRISM Claim Analysis performance for patent jobs belonging to a Benchmark Project."
     )
 
-    available_standards = get_available_standards()
+    benchmark_projects = get_benchmark_projects()
 
     with st.container(border=True):
-        st.subheader("Job Filters")
+        recent_benchmarks = benchmark_projects[:10]
 
-        recent_projects = get_recent_projects_list(30)
-        recent_projects = [p for p in recent_projects if "test" not in p]
-
-        def populate_project_name():
-            selection = st.session_state.get("project_pills")
+        def _on_pill_change():
+            selection = st.session_state.get("benchmark_pills")
             if selection:
-                st.session_state["project_name_input"] = selection
+                st.session_state["benchmark_select"] = selection
 
-        if recent_projects:
+        if recent_benchmarks:
             st.pills(
-                "Recent Projects",
-                recent_projects,
+                "Recent Benchmarks",
+                recent_benchmarks,
                 selection_mode="single",
-                key="project_pills",
-                on_change=populate_project_name,
+                key="benchmark_pills",
+                on_change=_on_pill_change,
             )
 
-        col9, col10 = st.columns(2)
-        with col9:
-            project_name = st.text_input("Project Name", key="project_name_input")
-        with col10:
-            standard = st.selectbox(
-                "Standard",
-                options=available_standards,
-                help="Select the standard to filter jobs by.",
-            )
+        project_name = st.selectbox(
+            "Project Benchmark Name",
+            options=benchmark_projects,
+            index=None,
+            key="benchmark_select",
+            help="Select a benchmark project to evaluate.",
+        )
+
+        available_standards = (
+            get_standards_for_project(project_name) if project_name else []
+        )
+        standard = st.selectbox(
+            "Standard",
+            options=available_standards,
+            index=0 if available_standards else None,
+            help="Select the standard to evaluate against.",
+        )
 
         col1, col2 = st.columns(2)
         with col1:
@@ -285,19 +290,19 @@ def main():
                 value="",
             )
         with col4:
-            limit_jobs = st.number_input(
-                "Limit Jobs",
+            limit_claims = st.number_input(
+                "Limit Claims",
                 min_value=0,
                 max_value=100000,
                 value=0,
-                help="Maximum number of jobs to fetch. Set to 0 to disable.",
+                help="Max number of unique claims (latest job per claim). Set to 0 to disable.",
             )
 
         col5, col6 = st.columns(2)
         with col5:
             filter_is_independent = st.checkbox(
                 "Must be Independent Claim",
-                value=False,
+                value=True,
                 help="Only retrieve jobs associated with independent claims.",
             )
         with col6:
@@ -307,31 +312,11 @@ def main():
                 help="Only retrieve jobs for the first claim of a patent.",
             )
 
-        st.markdown("---")
-        st.subheader("Benchmark Filters")
-
-        benchmark_names = get_benchmark_names(standard) if standard else []
-        benchmark_name = st.selectbox(
-            "Benchmark Name",
-            options=benchmark_names,
-            help="Select the specific benchmark name to evaluate the jobs.",
+        balance_essentiality = st.checkbox(
+            "Balance essentiality",
+            value=False,
+            help="Sample an equal number of Positive and Negative claims from the benchmark.",
         )
-
-        col7, col8 = st.columns(2)
-        with col7:
-            limit_claims = st.number_input(
-                "Limit Benchmark Claims",
-                min_value=0,
-                max_value=10000,
-                value=0,
-                help="Maximum number of claim IDs to extract from the benchmark for evaluation. Set to 0 to disable.",
-            )
-        with col8:
-            balance_essentiality = st.checkbox(
-                "Balance essentiality",
-                value=False,
-                help="Sample an equal number of Positive and Negative claims from the benchmark.",
-            )
 
         submitted = st.button("Run Evaluation", type="primary")
 
@@ -340,13 +325,11 @@ def main():
             del st.session_state["metrics_explanation"]
 
         if not project_name:
-            st.warning("Please enter a Project Name.")
+            st.warning("Please select a Project Benchmark.")
         elif not standard:
             st.warning("Please select a Standard.")
-        elif not benchmark_name:
-            st.warning("Please select a Benchmark Name.")
         else:
-            tp_ids, tn_ids = get_standard_truth_labels(standard, benchmark_name)
+            tp_ids, tn_ids = get_standard_truth_labels(standard, project_name)
 
             if balance_essentiality:
                 min_len = min(len(tp_ids), len(tn_ids))
@@ -362,9 +345,7 @@ def main():
                 valid_ids = valid_ids[:limit_claims]
 
             if not valid_ids:
-                st.error(
-                    "No valid claim IDs found for the selected standard benchmark."
-                )
+                st.error("No valid claim IDs found for the selected benchmark project.")
                 return
 
             with st.spinner("Fetching job statistics..."):
@@ -377,7 +358,7 @@ def main():
                         standard,
                         filter_is_independent,
                         filter_claim_number_1,
-                        limit_jobs,
+                        limit_claims,
                     )
                     st.session_state["job_stats"] = {
                         "total_jobs": total_jobs,
@@ -398,7 +379,7 @@ def main():
                         standard,
                         filter_is_independent,
                         filter_claim_number_1,
-                        limit_jobs,
+                        limit_claims,
                     )
 
                     if not jobs:
@@ -437,12 +418,15 @@ def main():
         if "job_stats" in st.session_state:
             stats = st.session_state["job_stats"]
             st.success(
-                f"**Total jobs requested:** {stats['total_jobs']} jobs from {stats['unique_patents']} unique patents."
+                f"**Total jobs requested:** {stats['total_jobs']} jobs  "
+                f"covering {df['claim_uuid'].n_unique()} unique claims "
+                f"from {stats['unique_patents']} unique patents."
             )
         else:
             st.success(f"Found {len(df)} jobs for project '{eval_project_name}'.")
         st.info(
-            f"**Benchmark Match:** {len(df)} jobs matched out of {len(tp_ids + tn_ids)} benchmark claims."
+            f"**Labeled Claims:** {len(tp_ids) + len(tn_ids)} unique claims with "
+            f"essentiality labels ({len(tp_ids)} positive, {len(tn_ids)} negative)."
         )
 
         df_eval = None

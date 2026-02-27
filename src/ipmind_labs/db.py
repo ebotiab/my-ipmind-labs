@@ -116,78 +116,65 @@ def get_jobs_for_project(
     return [JobRecord.model_validate(dict(r)) for r in rows]
 
 
-def get_recent_projects_list(limit: int = 10) -> list[str]:
-    """Retrieves the names of the most recently created projects."""
+def get_benchmark_projects() -> list[str]:
+    """Retrieves names of projects where is_benchmark = true."""
     query = """
     SELECT name
     FROM projects
     WHERE organization_id = '61a01994-8e93-42b0-a0f7-a46db8f8e883'
+      AND is_benchmark = true
     ORDER BY created_at DESC
-    LIMIT :limit
-    """
-    conn = _get_conn()
-    with conn.session as session:
-        result = session.execute(text(query), {"limit": limit})
-        rows = result.mappings().all()
-
-    return [r["name"] for r in rows if r["name"]]
-
-
-def get_available_standards() -> list[str]:
-    """
-    Retrieves the possible values of the custom enum type used in the 'standard'
-    column of the 'prism_benchmarks' table.
-    """
-    query = """
-    SELECT e.enumlabel
-    FROM pg_enum e
-    JOIN pg_type t ON e.enumtypid = t.oid
-    JOIN pg_attribute a ON a.atttypid = t.oid
-    JOIN pg_class c ON a.attrelid = c.oid
-    WHERE c.relname = 'prism_benchmarks' AND a.attname = 'standard'
-    ORDER BY e.enumsortorder
     """
     conn = _get_conn()
     with conn.session as session:
         result = session.execute(text(query))
         rows = result.mappings().all()
 
-    return [r["enumlabel"] for r in rows]
+    return [r["name"] for r in rows if r["name"]]
 
 
-def get_benchmark_names(standard: str) -> list[str]:
-    """Retrieves the unique benchmark names for a given standard."""
+def get_standards_for_project(project_name: str) -> list[str]:
+    """Returns the unique standards associated with a project's jobs."""
     query = """
-    SELECT DISTINCT name
-    FROM prism_benchmarks
-    WHERE standard::text = :standard AND name IS NOT NULL
-    ORDER BY name
+    SELECT DISTINCT pr.standard::text AS standard
+    FROM projects p
+    JOIN project_patents pp ON p.id = pp.project_id
+    JOIN jobs j ON j.project_patent_id = pp.id
+    JOIN prism_results pr ON pr.job_id = j.id
+    WHERE p.name = :project_name
+      AND p.organization_id = '61a01994-8e93-42b0-a0f7-a46db8f8e883'
+    ORDER BY standard
     """
-    conn = _get_conn(ttl=60*60)
+    conn = _get_conn()
     with conn.session as session:
-        result = session.execute(text(query), {"standard": standard})
+        result = session.execute(text(query), {"project_name": project_name})
         rows = result.mappings().all()
 
-    return [r["name"] for r in rows]
+    return [r["standard"] for r in rows]
 
 
 def get_standard_truth_labels(
     standard: str,
-    benchmark_name: str,
+    project_name: str,
 ) -> tuple[list[str], list[str]]:
     """
-    Retrieves claim IDs for a given standard and benchmark name from the prism_benchmarks table,
-    segregated into true positives (1) and true negatives (0).
+    Retrieves essentiality labels for claims that belong to the benchmark project,
+    filtered by standard. Returns (true_positive_ids, true_negative_ids).
     """
     query = """
-    SELECT claim_id::text, expected_essentiality
-    FROM prism_benchmarks
-    WHERE standard::text = :standard AND name = :benchmark_name
+    SELECT ce.claim_id::text, ce.expected_essentiality
+    FROM claim_essentiality_labels ce
+    JOIN patent_claims c ON ce.claim_id = c.id
+    JOIN project_patents pp ON c.patent_id = pp.patent_id
+    JOIN projects p ON pp.project_id = p.id
+    WHERE ce.standard::text = :standard
+      AND p.name = :project_name
+      AND p.organization_id = '61a01994-8e93-42b0-a0f7-a46db8f8e883'
     """
     conn = _get_conn()
     with conn.session as session:
         result = session.execute(
-            text(query), {"standard": standard, "benchmark_name": benchmark_name}
+            text(query), {"standard": standard, "project_name": project_name}
         )
         rows = result.mappings().all()
 
