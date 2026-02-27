@@ -331,13 +331,6 @@ def main():
         else:
             tp_ids, tn_ids = get_standard_truth_labels(standard, project_name)
 
-            if balance_essentiality:
-                min_len = min(len(tp_ids), len(tn_ids))
-                if len(tp_ids) > min_len:
-                    tp_ids = random.sample(tp_ids, min_len)
-                elif len(tn_ids) > min_len:
-                    tn_ids = random.sample(tn_ids, min_len)
-
             valid_ids = tp_ids + tn_ids
 
             if limit_claims > 0:
@@ -401,6 +394,23 @@ def main():
                     else:
                         df = pl.DataFrame([j.model_dump() for j in jobs])
 
+                    # Balance AFTER fetching so we only count claims with actual jobs
+                    fetched_claims = set(df["claim_uuid"].cast(pl.Utf8).to_list())
+                    tp_ids = [c for c in tp_ids if c in fetched_claims]
+                    tn_ids = [c for c in tn_ids if c in fetched_claims]
+
+                    if balance_essentiality:
+                        min_len = min(len(tp_ids), len(tn_ids))
+                        if len(tp_ids) > min_len:
+                            tp_ids = random.sample(tp_ids, min_len)
+                        if len(tn_ids) > min_len:
+                            tn_ids = random.sample(tn_ids, min_len)
+                        # Filter df to only keep balanced claims
+                        balanced_ids = set(tp_ids + tn_ids)
+                        df = df.filter(
+                            pl.col("claim_uuid").cast(pl.Utf8).is_in(balanced_ids)
+                        )
+
                     st.session_state["fetched_df"] = df
                     st.session_state["tp_ids"] = tp_ids
                     st.session_state["tn_ids"] = tn_ids
@@ -424,9 +434,12 @@ def main():
             )
         else:
             st.success(f"Found {len(df)} jobs for project '{eval_project_name}'.")
+        fetched_claim_ids = set(df["claim_uuid"].cast(pl.Utf8).to_list())
+        matched_tp = [c for c in tp_ids if c in fetched_claim_ids]
+        matched_tn = [c for c in tn_ids if c in fetched_claim_ids]
         st.info(
-            f"**Labeled Claims:** {len(tp_ids) + len(tn_ids)} unique claims with "
-            f"essentiality labels ({len(tp_ids)} positive, {len(tn_ids)} negative)."
+            f"**Labeled Claims:** {len(matched_tp) + len(matched_tn)} unique claims with "
+            f"essentiality labels ({len(matched_tp)} positive, {len(matched_tn)} negative)."
         )
 
         df_eval = None
