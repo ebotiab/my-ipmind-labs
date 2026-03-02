@@ -38,9 +38,9 @@ metrics_explainer_agent = Agent(
 )
 
 
-async def get_metrics_summary(metrics: ModelMetrics):
+def get_metrics_summary(metrics: ModelMetrics):
     user_prompt = f"Please analyze these metrics:\n{format_as_xml(metrics)}"
-    result = await metrics_explainer_agent.run(user_prompt)
+    result = metrics_explainer_agent.run_sync(user_prompt)
     return result.output
 
 
@@ -59,7 +59,7 @@ async def main():
 
     print("Analysing metrics with GPT-4o-mini in Azure...\n")
 
-    result = await get_metrics_summary(my_results)
+    result = get_metrics_summary(my_results)
 
     print(result)
 

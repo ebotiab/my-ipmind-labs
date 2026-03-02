@@ -1,4 +1,3 @@
-import asyncio
 import datetime
 import random
 
@@ -109,7 +108,7 @@ def display_metrics(
                 fn=int(fn),
             )
             try:
-                explanation = asyncio.run(get_metrics_summary(metrics))
+                explanation = get_metrics_summary(metrics)
                 st.session_state["metrics_explanation"] = explanation
             except Exception as e:
                 st.error(f"Explanation failed: {e}")
