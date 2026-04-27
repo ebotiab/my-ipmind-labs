@@ -21,14 +21,10 @@ def _(pl):
     # Read both sheets   # noqa: F401
 
     file_path = "../data/Wi-Fi 6 TRUE POSITIVE AND NEGATIVES.xlsx"
-    df_tp = pl.read_excel(
-        file_path, sheet_name="TRUE POSITIVES"
-    ).with_columns(  # ty:ignore[possibly-missing-attribute]
+    df_tp = pl.read_excel(file_path, sheet_name="TRUE POSITIVES").with_columns(
         pl.lit("TRUE POSITIVES").alias("label")
     )
-    df_tn = pl.read_excel(
-        file_path, sheet_name="TRUE NEGATIVES"
-    ).with_columns(  # ty:ignore[possibly-missing-attribute]
+    df_tn = pl.read_excel(file_path, sheet_name="TRUE NEGATIVES").with_columns(
         pl.lit("TRUE NEGATIVES").alias("label")
     )
     df_combined = pl.concat(
@@ -87,7 +83,7 @@ def _(engine, mo, values_str):
         JOIN 
             public.patent_claims pc ON pc.patent_id = p.id AND pc.number_in_patent = t.claims_number;
         """,
-        engine=engine
+        engine=engine,
     )
     return (claim_ids_df,)
 
